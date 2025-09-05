@@ -15,23 +15,66 @@ st.set_page_config(page_title="DCA em Bitcoin (BRL)", page_icon="🪙", layout="
 @st.cache_data(show_spinner=False)
 def load_series(start_date: date, end_date: date) -> pd.DataFrame:
     """
-    Baixa séries diárias: BTC-USD e USDBRL=X (Yahoo Finance).
-    Converte para BTC-BRL = (BTC-USD) * (USDBRL).
-    Retorna DataFrame com colunas: ['btc_usd', 'usd_brl', 'btc_brl'] indexado por data.
+    Baixa séries diárias: BTC-USD e USDBRL=X (Yahoo Finance) e converte para BTC-BRL = (BTC-USD) * (USDBRL).
+    Retorna DataFrame com colunas ['btc_usd', 'usd_brl', 'btc_brl'] indexado por data.
+    É robusta a MultiIndex de colunas e à ausência de 'Adj Close'.
     """
-    # yfinance aceita strings de data
-    btc = yf.download("BTC-USD", start=start_date, end=end_date, progress=False)[["Adj Close"]].rename(columns={"Adj Close":"btc_usd"})
-    fx  = yf.download("USDBRL=X", start=start_date, end=end_date, progress=False)[["Adj Close"]].rename(columns={"Adj Close":"usd_brl"})
 
-    df = btc.join(fx, how="outer").sort_index()
-    # Preenche feriados/fins de semana: BTC negocia 7d, FX não; ffill resolve lacunas do câmbio
+    def _download_single(ticker: str) -> pd.Series:
+        df = yf.download(
+            ticker,
+            start=start_date,
+            end=end_date,
+            progress=False,
+            auto_adjust=False,   # mantemos 'Adj Close' se existir
+            group_by="column"    # evita multiindex na maioria dos casos, mas tratamos se vier
+        )
+
+        if df is None or len(df) == 0:
+            raise RuntimeError(f"Nenhum dado retornado para {ticker}. Tente outro intervalo ou verifique a rede.")
+
+        # Se vier MultiIndex (nível 0: OHLCV / nível 1: ticker)
+        if isinstance(df.columns, pd.MultiIndex):
+            # tenta 'Adj Close' e depois 'Close'
+            for field in ("Adj Close", "Close"):
+                if (field, ticker) in df.columns:
+                    s = df[(field, ticker)].rename(ticker)
+                    break
+            else:
+                raise KeyError(f"Nem 'Adj Close' nem 'Close' encontrados para {ticker}. Colunas: {list(df.columns)}")
+        else:
+            # colunas simples
+            for field in ("Adj Close", "Close"):
+                if field in df.columns:
+                    s = df[field].rename(ticker)
+                    break
+            else:
+                raise KeyError(f"Nem 'Adj Close' nem 'Close' encontrados para {ticker}. Colunas: {list(df.columns)}")
+
+        # Remove NaN extremos e ordena
+        s = s.sort_index().dropna()
+        return s
+
+    btc_usd = _download_single("BTC-USD")
+    usd_brl = _download_single("USDBRL=X")
+
+    df = pd.concat([btc_usd.rename("btc_usd"), usd_brl.rename("usd_brl")], axis=1).sort_index()
+
+    # Preenche lacunas típicas do câmbio (fim de semana/feriados)
     df["usd_brl"] = df["usd_brl"].ffill()
-    # Se BTC tiver buraco raro, ffill também
+    # Preenche eventual buraco do BTC (raro)
     df["btc_usd"] = df["btc_usd"].ffill()
+
+    # Calcula BTC em BRL
     df["btc_brl"] = df["btc_usd"] * df["usd_brl"]
-    # remove linhas totalmente vazias
+
+    # Garante que não ficou tudo NaN
     df = df.dropna(subset=["btc_brl"])
+    if df.empty:
+        raise RuntimeError("Série BTC-BRL ficou vazia após tratamento. Verifique o período escolhido.")
+
     return df
+
 
 def brl(x: float) -> str:
     s = f"{x:,.2f}"
@@ -247,3 +290,4 @@ with st.expander("⚙️ Metodologia"):
 - **Preço médio (PM)** = `Aportes acumulados / BTC acumulado`.  
 - **Valor atual** usa o último preço disponível da série.
     """)
+
