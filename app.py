@@ -64,4 +64,186 @@ with st.spinner("Carregando séries de preços..."):
 # ----------------------------
 # Gera meses do intervalo
 months = pd.period_range(start=pd.Timestamp(start_dt).to_period("M"),
-                         end=pd.Timestamp(e
+                         end=pd.Timestamp(end_dt).to_period("M"), freq="M")
+
+exec_dates = []
+for m in months:
+    # data alvo = ano-mês com dia D
+    target = pd.Timestamp(year=m.year, month=m.month, day=min(dia_d, 28))
+    # janela do mês
+    month_start = pd.Timestamp(year=m.year, month=m.month, day=1)
+    month_end   = (month_start + pd.offsets.MonthEnd(0)).normalize()
+    # candidatos: dia D ou próximo dia disponível dentro do mês
+    # 1) se existe exatamente o dia D na série
+    if target in px.index:
+        exec_dt = target
+    else:
+        # 2) próximo dia disponível >= target dentro do mês
+        after = px.loc[(px.index >= target) & (px.index <= month_end)]
+        if len(after) > 0:
+            exec_dt = after.index[0]
+        else:
+            # 3) fallback: último dia disponível no mês (<= month_end)
+            before = px.loc[(px.index >= month_start) & (px.index <= month_end)]
+            if len(before) > 0:
+                exec_dt = before.index[-1]
+            else:
+                # se não houver dados no mês, pula (raro)
+                continue
+    exec_dates.append(exec_dt)
+
+exec_dates = sorted(pd.unique(exec_dates))
+
+# ----------------------------
+# Simulação DCA
+# ----------------------------
+records = []
+btc_cum = 0.0
+brl_investido = 0.0
+
+for dt in exec_dates:
+    price_brl = float(px.loc[dt, "btc_brl"])
+    if aporte_mensal > 0 and price_brl > 0:
+        qty_btc = aporte_mensal / price_brl
+        btc_cum += qty_btc
+        brl_investido += aporte_mensal
+        pm = brl_investido / btc_cum  # preço médio BRL/BTC
+    else:
+        qty_btc = 0.0
+        pm = brl_investido / btc_cum if btc_cum > 0 else np.nan
+
+    # valor de mercado na data do aporte
+    val_brl = btc_cum * price_brl
+    pnl = val_brl - brl_investido
+    roi = (pnl / brl_investido * 100.0) if brl_investido > 0 else 0.0
+
+    records.append({
+        "Data": dt.normalize(),
+        "Preço BTC (BRL)": price_brl,
+        "Aporte (R$)": aporte_mensal,
+        "BTC comprado": qty_btc,
+        "BTC acumulado": btc_cum,
+        "Aportes acumulados (R$)": brl_investido,
+        "Valor de mercado (R$)": val_brl,
+        "P&L (R$)": pnl,
+        "ROI (%)": roi,
+        "Preço médio (BRL/BTC)": pm
+    })
+
+dca = pd.DataFrame(records)
+
+# Se ainda não houve nenhum mês (ex.: aporte=0), cria linha final “marcada” com valor atual
+if dca.empty:
+    last_px = float(px["btc_brl"].iloc[-1])
+    dca = pd.DataFrame([{
+        "Data": px.index[-1].normalize(),
+        "Preço BTC (BRL)": last_px,
+        "Aporte (R$)": 0.0,
+        "BTC comprado": 0.0,
+        "BTC acumulado": 0.0,
+        "Aportes acumulados (R$)": 0.0,
+        "Valor de mercado (R$)": 0.0,
+        "P&L (R$)": 0.0,
+        "ROI (%)": 0.0,
+        "Preço médio (BRL/BTC)": np.nan
+    }])
+
+# Valor “atual” com último preço
+last_price = float(px["btc_brl"].iloc[-1])
+btc_total = float(dca["BTC acumulado"].iloc[-1])
+invest_total = float(dca["Aportes acumulados (R$)"].iloc[-1])
+val_atual = btc_total * last_price
+pnl_atual = val_atual - invest_total
+roi_atual = (pnl_atual / invest_total * 100.0) if invest_total > 0 else 0.0
+preco_medio = float(dca["Preço médio (BRL/BTC)"].iloc[-1]) if btc_total > 0 else np.nan
+
+# ----------------------------
+# Cabeçalho
+# ----------------------------
+st.title("🪙 DCA em Bitcoin (BRL)")
+st.write("Configure **Y** (anos), **D** (dia do mês) e o **aporte mensal** para simular compras recorrentes de BTC em reais.")
+
+# ----------------------------
+# KPIs
+# ----------------------------
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Total aportado", brl(invest_total))
+k2.metric("Valor atual", brl(val_atual))
+k3.metric("P&L", brl(pnl_atual), f"{roi_atual:,.2f}%")
+k4.metric("BTC acumulado", f"{btc_total:,.8f}")
+k5.metric("Preço médio", brl(preco_medio) if np.isfinite(preco_medio) else "—")
+
+st.caption(f"Último preço do BTC (BRL): **{brl(last_price)}** — dados Yahoo Finance (BTC-USD × USDBRL=X).")
+
+# ----------------------------
+# Gráfico 1: Preço do BTC em BRL (diário)
+# ----------------------------
+st.subheader("Preço do BTC em BRL (diário)")
+chart_price = alt.Chart(px.reset_index().rename(columns={"index":"Data"})).mark_line().encode(
+    x=alt.X("Date:T", title="Data"),
+    y=alt.Y("btc_brl:Q", title="Preço (R$)"),
+    tooltip=[alt.Tooltip("Date:T", title="Data"), alt.Tooltip("btc_brl:Q", title="Preço (R$)", format=",.2f")]
+).properties(height=360)
+st.altair_chart(chart_price, use_container_width=True)
+
+# ----------------------------
+# Gráfico 2: Evolução mensal da carteira (R$) e BTC
+# ----------------------------
+st.subheader("Evolução mensal: carteira (R$) e BTC acumulado")
+
+# série em reais
+val_chart = alt.Chart(dca).mark_line(point=True).encode(
+    x=alt.X("Data:T", title="Data"),
+    y=alt.Y("Valor de mercado (R$):Q", title="Valor de mercado (R$)"),
+    tooltip=[
+        alt.Tooltip("Data:T", title="Data"),
+        alt.Tooltip("Valor de mercado (R$):Q", format=",.2f"),
+        alt.Tooltip("Aportes acumulados (R$):Q", format=",.2f"),
+        alt.Tooltip("BTC acumulado:Q", format=",.8f"),
+        alt.Tooltip("Preço médio (BRL/BTC):Q", format=",.2f"),
+        alt.Tooltip("ROI (%):Q", format=",.2f"),
+    ]
+).properties(height=340)
+
+# série em BTC (escala separada)
+btc_chart = alt.Chart(dca).mark_line(point=True).encode(
+    x=alt.X("Data:T", title="Data"),
+    y=alt.Y("BTC acumulado:Q", title="BTC acumulado"),
+    tooltip=[alt.Tooltip("Data:T"), alt.Tooltip("BTC acumulado:Q", format=",.8f")]
+).properties(height=220)
+
+st.altair_chart(val_chart, use_container_width=True)
+st.altair_chart(btc_chart, use_container_width=True)
+
+# ----------------------------
+# Tabela & Download
+# ----------------------------
+if mostrar_tabela:
+    st.subheader("Tabela de aportes mensais")
+    st.dataframe(
+        dca.assign(**{
+            "Preço BTC (BRL)": dca["Preço BTC (BRL)"].map(lambda x: f"{x:,.2f}"),
+            "Aporte (R$)": dca["Aporte (R$)"].map(lambda x: f"{x:,.2f}"),
+            "BTC comprado": dca["BTC comprado"].map(lambda x: f"{x:,.8f}"),
+            "BTC acumulado": dca["BTC acumulado"].map(lambda x: f"{x:,.8f}"),
+            "Aportes acumulados (R$)": dca["Aportes acumulados (R$)"].map(lambda x: f"{x:,.2f}"),
+            "Valor de mercado (R$)": dca["Valor de mercado (R$)"].map(lambda x: f"{x:,.2f}"),
+            "P&L (R$)": dca["P&L (R$)"].map(lambda x: f"{x:,.2f}"),
+            "ROI (%)": dca["ROI (%)"].map(lambda x: f"{x:,.2f}")
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+csv = dca.to_csv(index=False).encode("utf-8-sig")
+st.download_button("⬇️ Baixar CSV (aportes mensais)", data=csv, file_name="dca_btc_brl.csv", mime="text/csv")
+
+with st.expander("⚙️ Metodologia"):
+    st.markdown("""
+- Preço **BTC-BRL** é calculado como `BTC-USD × USDBRL`.
+- Aporte executado no **dia D** de cada mês; se não houver cotação nesse dia:
+  1) usa o **próximo dia disponível** dentro do mês,  
+  2) senão, usa o **último dia disponível** do mês.
+- **Preço médio (PM)** = `Aportes acumulados / BTC acumulado`.  
+- **Valor atual** usa o último preço disponível da série.
+    """)
