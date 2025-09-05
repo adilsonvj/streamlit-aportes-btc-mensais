@@ -1,4 +1,6 @@
 streamlit>=1.36
-altair>=5
+yfinance>=0.2.40
 pandas>=2
 numpy>=1.26
+altair>=5
+python-dateutil>=2.9
